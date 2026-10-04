@@ -1,0 +1,4 @@
+interface:
+  display_name: "ChatGPT 生图兼容层"
+  short_description: "用 ChatGPT/Codex 套餐额度生图或改图：委托稳定版 Codex CLI 通过 codex exec 执行 $imagegen"
+  default_prompt: "使用 $imagegen-chatgpt-compat，把下面的描述生成为图片并保存到 ./generated："
