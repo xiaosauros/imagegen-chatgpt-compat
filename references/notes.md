@@ -43,8 +43,8 @@ error sending request for url (https://chatgpt.com/backend-api/codex/images/gene
 | prompt 走 stdin 传给 `codex exec` | 多行/含引号 prompt 不经过命令行转义；Windows 下经 npx 多层传参引号会被剥离 |
 | `-c model_reasoning_effort=medium` 用裸值 | codex `-c` 对非 TOML 值按字面字符串处理（官方帮助明示）；实测穿透 npx 链路可用 |
 | 子进程 cwd = 输出目录 + `--sandbox workspace-write` | 子 agent 把成图复制到"当前目录"不需要越权；imagegen 工具本身由 CLI 核心发起 HTTP，不受 sandbox 影响 |
-| 图片定位顺序：输出目录(本次) → 子进程输出中的路径 → `~/.codex/generated_images`(本次) → 输出目录(不限时间，标记兜底) | imagegen 工具默认把成图落在 `~/.codex/generated_images/<uuid>/`；agent 移动文件会保留 mtime，所以文本提取是必要补充 |
-| `--output-last-message` 按版本探测 | 0.143.0 实测**没有**该 flag，新版有；探测后支持才加 `-o` |
+| 图片定位顺序：输出目录(本次) → 子进程输出中的现存路径 → `~/.codex/generated_images`(本次) | imagegen 工具默认把成图落在 `~/.codex/generated_images/<uuid>/`；agent 移动文件会保留 mtime，所以文本提取是必要补充。不能用输出目录旧图片兜底，否则可能误报成功 |
+| 不依赖 `--output-last-message` | 0.143.0 当前官方 npm 包的 `codex exec --help` 已列出该 flag；脚本直接读取 stdout/stderr 并扫描本次生成图片，省去每次额外的帮助探测 |
 | network error 最多重试 1 次 | 一次失败可能已消耗 4~5 分钟；反复重试浪费额度。model/tool 不可用才是"换池"信号，且失败很快 |
 | 不自动二次视觉 review | 生成 → 重开图 → 视觉分析 → 再改的流程会成倍消耗额度/时间；用户明确要求才 review |
 
@@ -53,7 +53,7 @@ error sending request for url (https://chatgpt.com/backend-api/codex/images/gene
 1. 社区/官方确认新的稳定版本后，加入 `IMAGEGEN_CODEX_VERSIONS`（稳定版在前），不要删旧稳定版。
 2. 模型下架（`model_unsupported`）→ 更新 `IMAGEGEN_MODEL` / `IMAGEGEN_MODEL_FALLBACKS` 为当前套餐可用模型。
 3. 旧 CLI 不认识新模型（换模型也失败）→ 说明需要更新的 CLI：把最新验证版本加入池，或临时 `--codex-versions latest`（注意 latest 可能正是有 regression 的版本，network error 会很快停止不重试）。
-4. 定期跑：`node scripts/imagegen.mjs --self-check`（验证每个版本 CLI 可用 + ChatGPT 登录态 + 参数支持，不耗额度）。
+4. 需要排查环境时跑：`node scripts/imagegen.mjs --self-check`（验证每个版本 CLI 启动与 ChatGPT 登录态，不调用生图）。正常生图调用会自动执行 CLI 启动检查，无需单独自检。
 
 ## 想继续定位根因时
 
@@ -63,4 +63,4 @@ diff `rust-v0.143.0..rust-v0.144.0`，搜索：`image_generation`、`images/gene
 
 - Windows 下参考图路径经 npx 传递：路径含空格理论上可能出问题（promise-spawn 会加引号，通常没事）；遇到问题时把文件复制到无空格路径再传。
 - 服务端 4~5 分钟级失败客户端无解；脚本只能保证"失败尽快、类型明确、不浪费重试"。
-- 首次使用某个池版本时 npx 要下载包（几十秒），之后走缓存。
+- 首次使用某个池版本时 npx 要下载 CLI 和平台二进制；macOS arm64 实测约 4 分钟。脚本使用可写的临时 npm 缓存，并在安装期间报告进度。受限执行环境若阻止访问外网或本机代理，仍需给该次命令联网权限。

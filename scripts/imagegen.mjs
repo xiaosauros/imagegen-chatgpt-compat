@@ -13,7 +13,7 @@
 //
 // 用法：node imagegen.mjs "<prompt>" [-i 参考图...] [--out-dir ./generated] [--help]
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -23,7 +23,7 @@ const IS_WIN = process.platform === "win32";
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
 const EXIT = {
   OK: 0, UNKNOWN: 1, MODEL: 2, TOOL: 3, NETWORK: 4,
-  AUTH: 5, QUOTA: 6, ARGS: 7, NO_IMAGE: 8,
+  AUTH: 5, QUOTA: 6, ARGS: 7, NO_IMAGE: 8, CLI: 9,
 };
 const EXIT_FOR_TYPE = {
   model_unsupported: EXIT.MODEL,
@@ -33,6 +33,7 @@ const EXIT_FOR_TYPE = {
   quota_error: EXIT.QUOTA,
   unknown_error: EXIT.UNKNOWN,
   no_image_found: EXIT.NO_IMAGE,
+  cli_unavailable: EXIT.CLI,
 };
 
 function log(msg) {
@@ -99,7 +100,7 @@ const HELP = `
   -e, --effort <level>          model_reasoning_effort（默认 medium）
       --allow-api-key           允许子进程环境保留 OPENAI_API_KEY（默认强制删除）
       --dry-run                 只打印将执行的命令与 stdin 内容，不实际运行
-      --self-check              检查版本池内各 CLI 可用性、登录态与参数支持（不耗额度）
+      --self-check              检查版本池内各 CLI 可用性与登录态（不耗生图额度）
   -h, --help                    显示本帮助
 
 环境变量
@@ -113,7 +114,7 @@ const HELP = `
 
 退出码
   0 成功  1 未知  2 模型不可用  3 工具不可用  4 网络错误  5 未登录
-  6 额度  7 参数错误  8 正常结束但未找到图片
+  6 额度  7 参数错误  8 正常结束但未找到图片  9 CLI 不可用
 
 结果通过 stdout 输出机器可读块（RESULT / IMAGE_PATH / FAILURE_TYPE ...），
 过程日志在 stderr。
@@ -144,26 +145,7 @@ function resolveNpx() {
 
 // ---------- 命令构造 ----------
 
-const probeCache = new Map();
-
-function probeSupportsLastMessage(npx, version) {
-  if (probeCache.has(version)) return probeCache.get(version);
-  let ok = false;
-  try {
-    const r = spawnSync(
-      npx.cmd,
-      [...npx.head, "--yes", `--package=@openai/codex@${version}`, "--", "codex", "exec", "--help"],
-      { encoding: "utf8", timeout: 120_000, windowsHide: true },
-    );
-    ok = !r.error && r.status === 0 && String(r.stdout ?? "").includes("--output-last-message");
-  } catch (e) {
-    log(`探测 codex@${version} 是否支持 --output-last-message 失败，按不支持处理：${e.message}`);
-  }
-  probeCache.set(version, ok);
-  return ok;
-}
-
-function buildExecArgs({ npx, version, model, effort, images, lastMsgFile }) {
+function buildExecArgs({ version, model, effort, images }) {
   const args = [
     "--yes",
     `--package=@openai/codex@${version}`,
@@ -176,7 +158,6 @@ function buildExecArgs({ npx, version, model, effort, images, lastMsgFile }) {
     "-c", `model_reasoning_effort=${effort}`,
   ];
   for (const img of images) args.push("-i", img);
-  if (lastMsgFile && probeSupportsLastMessage(npx, version)) args.push("-o", lastMsgFile);
   return args;
 }
 
@@ -198,6 +179,13 @@ function buildFinalPrompt(rawPrompt) {
 function childEnv(allowApiKey) {
   const env = { ...process.env };
   if (!allowApiKey) delete env.OPENAI_API_KEY; // 强制走 ChatGPT 登录态
+  // 沙箱中 ~/.npm 通常不可写；把 npx 安装与缓存放在可写的临时目录。
+  if (!env.npm_config_cache && !env.NPM_CONFIG_CACHE) {
+    env.npm_config_cache = path.join(os.tmpdir(), "imagegen-chatgpt-compat-npm-cache");
+  }
+  if (!env.npm_config_registry && !env.NPM_CONFIG_REGISTRY) env.npm_config_registry = "https://registry.npmjs.org/";
+  // npm 自带的多次重试会让安装阶段长时间无输出；交给脚本统一报告失败。
+  if (!env.npm_config_fetch_retries && !env.NPM_CONFIG_FETCH_RETRIES) env.npm_config_fetch_retries = "0";
   return env;
 }
 
@@ -211,10 +199,40 @@ function killTree(child) {
   } catch { /* 进程可能已退出 */ }
 }
 
+function runCliCommand({ npx, version, subcommand, env, timeoutSeconds }) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const child = spawn(npx.cmd, [...npx.head, "--yes", `--package=@openai/codex@${version}`, "--", "codex", ...subcommand], {
+      env, windowsHide: true, detached: !IS_WIN, stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    let timedOut = false;
+    let settled = false;
+    const heartbeat = setInterval(() => {
+      log(`codex@${version} ${subcommand.join(" ")} 仍在运行（${Math.round((Date.now() - startedAt) / 1000)}s）`);
+    }, 30_000);
+    child.stdout.on("data", (d) => { if (out.length < 100_000) out += d; });
+    child.stderr.on("data", (d) => { if (err.length < 100_000) err += d; });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killTree(child);
+    }, timeoutSeconds * 1000);
+    const done = (exitCode, extraErr = "") => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(heartbeat);
+      resolve({ exitCode, out, err: extraErr ? `${err}\n${extraErr}` : err, timedOut, elapsedSeconds: ((Date.now() - startedAt) / 1000).toFixed(1) });
+    };
+    child.on("error", (e) => done(-1, e.message));
+    child.on("close", (code) => done(code));
+  });
+}
+
 function runAttempt({ npx, env, version, model, effort, images, finalPrompt, outDir, timeoutSeconds }) {
   return new Promise((resolve) => {
-    const lastMsgFile = path.join(os.tmpdir(), `imagegen-last-${process.pid}-${Date.now()}.txt`);
-    const args = buildExecArgs({ npx, version, model, effort, images, lastMsgFile });
+    const args = buildExecArgs({ version, model, effort, images });
     const startedAt = Date.now();
 
     const child = spawn(npx.cmd, [...npx.head, ...args], {
@@ -240,7 +258,7 @@ function runAttempt({ npx, env, version, model, effort, images, finalPrompt, out
 
     const done = (exitCode, extraErr) => {
       if (timer) clearTimeout(timer);
-      resolve({ exitCode, out, err: extraErr ? err + "\n" + extraErr : err, timedOut, startedAt, lastMsgFile });
+      resolve({ exitCode, out, err: extraErr ? err + "\n" + extraErr : err, timedOut, startedAt });
     };
     child.on("error", (e) => done(-1, e.message));
     child.on("close", (code) => done(code));
@@ -268,6 +286,7 @@ const SUGGESTIONS = {
   quota_error: "套餐额度/限流问题，告知用户。",
   unknown_error: "阅读脚本 stderr 中子进程输出 tail 后再决定，不要自动重试。",
   no_image_found: "子进程正常结束但没有产出图片：检查 prompt 是否被模型拒绝（见 stderr tail）。",
+  cli_unavailable: "指定版本的 Codex CLI 未能启动。检查 npx/npm 网络与缓存，或安装该版本；不要把安装失败当作生图网络错误重试。",
 };
 
 // ---------- 图片定位 ----------
@@ -332,18 +351,7 @@ function findImage({ startedAt, text, inputs, outDir }) {
   const genDir = path.join(os.homedir(), ".codex", "generated_images");
   const inGen = collectImages(genDir, startedAt).sort((a, b) => b.mtimeMs - a.mtimeMs);
   if (inGen.length) return { path: inGen[0].path, source: "codex_generated_images" };
-  // 4) 输出目录里不带时间过滤的最新图片（兜底，可能属于更早的运行）
-  const anyInOutDir = collectImages(outDir, null).sort((a, b) => b.mtimeMs - a.mtimeMs);
-  if (anyInOutDir.length) return { path: anyInOutDir[0].path, source: "out_dir_undated" };
   return null;
-}
-
-function safeRead(p) {
-  try {
-    return fs.readFileSync(p, "utf8");
-  } catch {
-    return "";
-  }
 }
 
 function tail(text, lines = 50) {
@@ -353,46 +361,38 @@ function tail(text, lines = 50) {
 
 // ---------- self-check / dry-run ----------
 
-function selfCheck({ npx, versions }) {
+async function selfCheck({ npx, versions, env }) {
   console.log(`SELF-CHECK npx: ${[npx.cmd, ...npx.head].join(" ")}`);
   const genDir = path.join(os.homedir(), ".codex", "generated_images");
   console.log(`SELF-CHECK generated_images_dir: ${genDir} ${fs.existsSync(genDir) ? "(存在)" : "(不存在，仅提示)"}`);
   let allOk = true;
   for (const v of versions) {
-    const run = (sub) => {
-      try {
-        const r = spawnSync(
-          npx.cmd,
-          [...npx.head, "--yes", `--package=@openai/codex@${v}`, "--", "codex", ...sub],
-          { encoding: "utf8", timeout: 180_000, windowsHide: true },
-        );
-        return {
-          out: String(r.stdout ?? "").trim(),
-          err: r.error ? `ERROR: ${r.error.message}` : String(r.stderr ?? "").trim(),
-        };
-      } catch (e) {
-        return { out: "", err: `ERROR: ${e.message}` };
-      }
-    };
-    const vRes = run(["--version"]);
-    const lRes = run(["login", "status"]);
-    const ver = vRes.out;
+    log(`检查 codex@${v} 启动（首次使用需下载平台包，最多 600s）`);
+    const vRes = await runCliCommand({ npx, version: v, subcommand: ["--version"], env, timeoutSeconds: 600 });
+    const ver = vRes.out.trim();
+    if (vRes.timedOut || vRes.exitCode !== 0 || !ver.startsWith("codex-cli")) {
+      allOk = false;
+      console.log(`SELF-CHECK codex@${v}: CLI FAIL (${vRes.timedOut ? "启动超时" : `exit=${vRes.exitCode}`}, ${vRes.elapsedSeconds}s)`);
+      console.error(`[imagegen] codex@${v} 启动输出:\n${tail(`${vRes.out}\n${vRes.err}`, 10)}`);
+      continue;
+    }
+    log(`检查 codex@${v} 登录态（最多 30s）`);
+    const lRes = await runCliCommand({ npx, version: v, subcommand: ["login", "status"], env, timeoutSeconds: 30 });
     // login status 的结果在 stderr；区分 "Logged in ..." 与 "Not logged in"
     const loginText = `${lRes.out}\n${lRes.err}`;
-    const loginOk = /not logged in/i.test(loginText) ? false : /logged in/i.test(loginText);
-    const supportsO = probeSupportsLastMessage(npx, v);
-    const ok = ver.startsWith("codex-cli") && loginOk;
+    const loginOk = lRes.exitCode === 0 && !lRes.timedOut && !/not logged in/i.test(loginText) && /logged in/i.test(loginText);
+    const ok = loginOk;
     if (!ok) allOk = false;
     console.log(
-      `SELF-CHECK codex@${v}: ${ver || vRes.err.split("\n")[0]} | login: ${loginOk ? "ChatGPT OK" : "FAIL"} | --output-last-message: ${supportsO ? "yes" : "no"} | ${ok ? "OK" : "FAIL"}`,
+      `SELF-CHECK codex@${v}: ${ver} | login: ${loginOk ? "ChatGPT OK" : "FAIL"} | ${ok ? "OK" : "FAIL"}`,
     );
-    if (!ok) console.error(`[imagegen] codex@${v} 输出:\n${tail(`${vRes.err}\n${lRes.err}`, 10)}`);
+    if (!ok) console.error(`[imagegen] codex@${v} 登录输出:\n${tail(loginText, 10)}`);
   }
   process.exit(allOk ? EXIT.OK : EXIT.UNKNOWN);
 }
 
 function dryRun({ versions, models, outDir, images, finalPrompt, timeoutSeconds, maxNetworkRetries, effort }) {
-  const args = buildExecArgs({ npx: { cmd: "npx", head: [] }, version: versions[0], model: models[0], effort, images, lastMsgFile: null });
+  const args = buildExecArgs({ version: versions[0], model: models[0], effort, images });
   console.log("DRY-RUN version_pool: " + versions.join(", "));
   console.log("DRY-RUN model_pool: " + models.join(", "));
   console.log(`DRY-RUN out_dir: ${outDir}`);
@@ -435,14 +435,14 @@ async function main() {
     return abs;
   });
 
-  // prompt：位置参数优先；否则从管道 stdin 读取
+  if (opts.selfCheck) {
+    await selfCheck({ npx: resolveNpx(), versions, env: childEnv(allowApiKey) });
+    return;
+  }
+  // 自检不需要 prompt，必须在它之后读取 stdin，避免在 Agent 管道环境中阻塞。
   let prompt = opts.prompt;
   if (prompt === null && !process.stdin.isTTY) {
     prompt = fs.readFileSync(0, "utf8");
-  }
-  if (opts.selfCheck) {
-    selfCheck({ npx: resolveNpx(), versions });
-    return;
   }
   if (prompt === null || !prompt.trim()) fail(EXIT.ARGS, "缺少 prompt（位置参数或 stdin 管道）");
 
@@ -466,23 +466,38 @@ async function main() {
   let attemptNo = 0;
   let lastVersion = versions[0];
   let lastModel = models[0];
+  const checkedVersions = new Set();
 
   while (true) {
     const version = versions[vi];
     const model = models[mi];
     lastVersion = version;
     lastModel = model;
+    if (!checkedVersions.has(version)) {
+      log(`检查 codex@${version} 启动（首次使用需下载平台包，最多 600s）`);
+      const check = await runCliCommand({ npx, version, subcommand: ["--version"], env, timeoutSeconds: 600 });
+      if (check.timedOut || check.exitCode !== 0 || !check.out.trim().startsWith("codex-cli")) {
+        console.log("RESULT: failure");
+        console.log("FAILURE_TYPE: cli_unavailable");
+        console.log(`CLI_VERSION: ${version}`);
+        console.log(`ATTEMPTS: ${attemptNo}`);
+        console.log(`ELAPSED_SECONDS: ${((Date.now() - startedAll) / 1000).toFixed(1)}`);
+        console.log(`SUGGESTION: ${SUGGESTIONS.cli_unavailable}`);
+        console.error(`[imagegen] CLI 启动${check.timedOut ? "超时" : `失败 (exit=${check.exitCode})`}，${check.elapsedSeconds}s。输出 tail:\n${tail(`${check.out}\n${check.err}`)}`);
+        process.exit(EXIT.CLI);
+      }
+      checkedVersions.add(version);
+    }
     attemptNo++;
     log(`尝试 #${attemptNo}: codex@${version} + ${model}`);
 
     const r = await runAttempt({ npx, env, version, model, effort, images, finalPrompt, outDir, timeoutSeconds });
     const elapsed = ((Date.now() - r.startedAt) / 1000).toFixed(1);
-    const text = [safeRead(r.lastMsgFile), r.out, r.err].join("\n");
+    const text = [r.out, r.err].join("\n");
 
     if (r.exitCode === 0) {
       const img = findImage({ startedAt: r.startedAt, text, inputs: images, outDir });
       if (img) {
-        if (img.source === "out_dir_undated") log("警告：仅在输出目录找到无时间标记的图片，可能属于更早的运行");
         console.log(`RESULT: success`);
         console.log(`IMAGE_PATH: ${img.path}`);
         console.log(`IMAGE_PATH_SOURCE: ${img.source}`);

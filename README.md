@@ -26,7 +26,7 @@ scripts/imagegen.mjs   主脚本（参数解析、版本/模型池切换、失�
 
 - 本机已安装 Node.js / npm（脚本通过 npx 拉起指定版本 CLI；Windows 下自动绕开 npx.cmd 批处理转义）。
 - 已用 ChatGPT 账号登录 Codex（`codex login`）。脚本默认从子进程环境中删除 `OPENAI_API_KEY`，强制走 ChatGPT 登录态（`--allow-api-key` 可放开）。
-- 首次运行某个版本时 npx 需要下载该包（约几十秒），之后走缓存。
+- 首次运行某个版本时脚本会用官方 npm registry 自动下载 CLI 和平台二进制，缓存放在可写的临时目录。实测 macOS arm64 首次安装约 4 分钟；启动检查每 30 秒提示一次，最多等待 600 秒。用户无需先手动安装或自检。
 
 ## 用法
 
@@ -42,7 +42,7 @@ node "<本仓库>/scripts/imagegen.mjs" "Replace the background with ..." \
   -i /absolute/path/to/style.jpg \
   --out-dir ./generated
 
-# 连通性检查（不消耗额度：各版本 CLI 可用性、登录态、参数支持）
+# 环境检查（不调用生图：各版本 CLI 启动与登录态）
 node "<本仓库>/scripts/imagegen.mjs" --self-check
 
 # 预览将执行的完整命令与 stdin 内容（不实际执行）
@@ -61,7 +61,7 @@ ATTEMPTS: 1
 ELAPSED_SECONDS: 95.3
 ```
 
-失败时输出 `RESULT: failure` + `FAILURE_TYPE` + `SUGGESTION`，按类型行动，不要用相同版本+相同模型盲目重试。完整失败类型对照表见 [`SKILL.md`](SKILL.md) 的「失败处理」一节。过程日志（每次尝试的退出码、耗时、子进程输出 tail）在 stderr。
+失败时输出 `RESULT: failure` + `FAILURE_TYPE` + `SUGGESTION`，按类型行动，不要用相同版本+相同模型盲目重试。CLI 安装、缓存或启动失败归类为 `cli_unavailable`，此时尚未提交生图请求。完整失败类型对照表见 [`SKILL.md`](SKILL.md) 的「失败处理」一节。过程日志（启动检查、每次尝试的退出码、耗时、子进程输出 tail）在 stderr。
 
 ## 配置项
 
@@ -92,7 +92,7 @@ export IMAGEGEN_MODEL_FALLBACKS="gpt-6.1-sol"
 - `0.143.0` 是社区验证过的纯生图稳定点（模型能力解析与 tool routing 与后续版本不同），但不是唯一正确版本，也不保证永远兼容未来模型。
 - 模型下架（`model_unsupported`）→ 更新 `IMAGEGEN_MODEL` / `IMAGEGEN_MODEL_FALLBACKS` 为当前套餐可用模型。
 - 换模型仍失败 → 说明旧 CLI 无法识别新模型，把新的验证版本加入 `IMAGEGEN_CODEX_VERSIONS` 池（保留旧稳定版在前，不要删）。
-- 定期跑 `node scripts/imagegen.mjs --self-check` 验证版本池（不耗额度）。
+- 定期跑 `node scripts/imagegen.mjs --self-check` 验证版本池的启动和登录态（不调用生图；不能证明生图服务连通）。
 
 ## 已知限制
 
